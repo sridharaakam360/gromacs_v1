@@ -1,0 +1,11 @@
+# GROMACS MD Runner - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+streamlit==1.31.1
+psutil==5.9.8
+numpy==1.26.4
+
+# Optional but recommended
+pandas==2.2.1  # For data analysis
+matplotlib==3.8.3  # For plotting results
