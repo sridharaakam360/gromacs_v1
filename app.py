@@ -10,7 +10,7 @@ import re  # for regex parsing in system info
 
 from system_info import cpu_info, gpu_info, check_mmpbsa_installed
 from mdp_utils import update_mdp_nsteps, get_mdp_file, generate_default_mmpbsa_in
-from gromacs_runner import run_md, stop_md, run_mmpbsa
+from gromacs_runner import detect_index_groups, run_md, stop_md, run_mmpbsa
 
 # --------------------------------------------------
 # Module-level lock for thread safety
@@ -713,6 +713,60 @@ elif tab == "MMPBSA Analysis":
 
         st.divider()
 
+        # In MMPBSA tab
+        st.subheader("Index Groups (critical!)")
+        col1, col2 = st.columns(2)
+        receptor_g = col1.number_input("Receptor / Protein group", value=1, min_value=1, step=1)
+        ligand_g   = col2.number_input("Ligand group", value=13, min_value=1, step=1)
+        # ────────────────────────────────────────────────
+        # In the MMPBSA tab, right after the "Customize Parameters" section
+        # ────────────────────────────────────────────────
+
+        st.markdown("### Index Group Selection")
+
+        # Run detection (you can cache it if you want)
+        with st.spinner("Detecting protein & ligand groups..."):
+            rec_group, lig_group = detect_index_groups(
+                analysis_dir,
+                "md.tpr",
+                log_callback=lambda msg: st.session_state.analysis_logs.append(msg)
+            )
+
+        # Show result in a nice box
+        if rec_group == 1 and lig_group == 13:
+            detection_type = "fallback / default"
+            icon = "⚠️"
+            explanation = "Auto-detection did not find clear Protein + Ligand groups → using common CHARMM-GUI defaults"
+        else:
+            detection_type = "auto-detected"
+            icon = "✅"
+            explanation = "Groups were successfully identified from index.ndx"
+
+        with st.container(border=True):
+            st.markdown(f"{icon} **Groups {detection_type}**")
+            st.markdown(f"• Receptor / Protein group: **{rec_group}**")
+            st.markdown(f"• Ligand group: **{lig_group}**")
+            st.caption(explanation)
+
+            if detection_type == "fallback / default":
+                st.info(
+                    "Most common values for CHARMM-GUI systems are:\n"
+                    "→ Protein = 1\n"
+                    "→ Ligand (UNK/LIG/MOL) = 12–15\n\n"
+                    "If the run fails, try manually changing them below."
+                )
+
+        # Optional: small expander with override
+        with st.expander("Change groups manually (if needed)", expanded=False):
+            col1, col2 = st.columns(2)
+            override_rec = col1.number_input("Receptor group", value=int(rec_group), min_value=1, step=1)
+            override_lig = col2.number_input("Ligand group",   value=int(lig_group),   min_value=1, step=1)
+
+            if override_rec != rec_group or override_lig != lig_group:
+                st.warning("→ Using **overridden** values when running MMPBSA")
+                rec_group = override_rec
+                lig_group = override_lig
+
         # ────────────────────────────────────────────────
         # Customize Parameters
         # ────────────────────────────────────────────────
@@ -837,6 +891,10 @@ fillratio = 4.0,
                         trajectory="md.xtc",
                         index_file="index.ndx",
                         input_file="mmpbsa.in",
+                        topology_file="topol.top",
+                        receptor_group=rec_group,   # ← CHANGE TO THIS (from None)
+                        ligand_group=lig_group,     # ← CHANGE TO THIS (from None)
+                        n_cores=None,
                         log_callback=log_cb,
                         progress_callback=progress_cb
                     )

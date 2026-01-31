@@ -15,7 +15,6 @@ from datetime import datetime
 
 
 
-
 def check_gmx_command():
     """Check if gmx command is available and return the command name"""
     try:
@@ -256,8 +255,8 @@ dt                       = 0.002
 nsteps                   = 500000
 
 ; Output control
-nstxout                  = 0
-nstvout                  = 0
+nstxout                  = 5000
+nstvout                  = 5000
 nstenergy                = 5000
 nstlog                   = 5000
 nstxout-compressed       = 5000
@@ -301,256 +300,158 @@ gen_vel                  = no
 """
         fname = "md.mdp"
     
-    fpath = os.path.join(gromacs_dir, fname)
-    with open(fpath, "w") as f:
-        f.write(content)
+    output_path = os.path.join(gromacs_dir, fname)
     
-    return fpath
-
-def select_input_structure(gromacs_dir, stage):
-    """
-    Select the appropriate input structure file based on stage and available files
-    
-    Args:
-        gromacs_dir: Path to GROMACS working directory
-        stage: Simulation stage
-    
-    Returns:
-        Filename (not full path) of the input structure
-    
-    Raises:
-        FileNotFoundError: If no suitable input file is found
-    """
-    if stage == "setup":
-        gro_file = "step3_input.gro"
-        if not os.path.exists(os.path.join(gromacs_dir, gro_file)):
-            raise FileNotFoundError(
-                f"Input structure {gro_file} not found. "
-                "Please provide step3_input.gro from CHARMM-GUI."
-            )
-    
-    elif stage == "equilibration":
-        # Priority: setup output > original input
-        if os.path.exists(os.path.join(gromacs_dir, "setup.gro")):
-            gro_file = "setup.gro"
-        elif os.path.exists(os.path.join(gromacs_dir, "step3_input.gro")):
-            gro_file = "step3_input.gro"
-        else:
-            raise FileNotFoundError(
-                "No input structure found for equilibration. "
-                "Run 'setup' stage first or provide step3_input.gro."
-            )
-    
-    else:  # production
-        # Priority: equilibration output > setup output > original input
-        if os.path.exists(os.path.join(gromacs_dir, "equil.gro")):
-            gro_file = "equil.gro"
-        elif os.path.exists(os.path.join(gromacs_dir, "setup.gro")):
-            gro_file = "setup.gro"
-        elif os.path.exists(os.path.join(gromacs_dir, "step3_input.gro")):
-            gro_file = "step3_input.gro"
-        else:
-            raise FileNotFoundError(
-                "No input structure found for production. "
-                "Run 'setup' or 'equilibration' stage first, or provide step3_input.gro."
-            )
-    
-    return gro_file
+    try:
+        with open(output_path, 'w') as f:
+            f.write(content)
+        return output_path
+    except Exception as e:
+        raise Exception(f"Failed to create MDP file {fname}: {str(e)}")
 
 def run_md(
-    gromacs_dir,
-    use_gpu,
-    threads,
-    total_steps,
-    resume=False,
-    log_callback=None,
-    progress_callback=None,
-    pid_callback=None,
-    stage="production"
+    gromacs_dir, 
+    stage, 
+    threads=1, 
+    use_gpu=False,
+    log_callback=None, 
+    progress_callback=None, 
+    pid_callback=None
 ):
     """
-    Run GROMACS MD simulation
+    Run a GROMACS MD simulation stage
     
     Args:
         gromacs_dir: Path to GROMACS working directory
-        use_gpu: Whether to use GPU acceleration
-        threads: Number of CPU threads
-        total_steps: Total number of MD steps to run
-        resume: Whether to resume from checkpoint
-        log_callback: Function to call with log messages
-        progress_callback: Function to call with progress updates
-        pid_callback: Function to call with process PID
         stage: Simulation stage ("setup", "equilibration", "production")
+        threads: Number of CPU threads to use
+        use_gpu: Whether to use GPU acceleration
+        log_callback: Function to receive log messages
+        progress_callback: Function to receive progress updates (current_step, total_steps)
+        pid_callback: Function to receive process ID
     
     Returns:
         Exit code (0 for success)
     
     Raises:
-        Exception: If simulation fails
+        Exception: On validation or execution errors
     """
-    
     # Default callbacks if none provided
     if log_callback is None:
-        log_callback = lambda x: print(x, end="")
+        log_callback = lambda msg: print(msg, end='')
     if progress_callback is None:
-        progress_callback = lambda step, total: None
+        progress_callback = lambda current, total: None
     if pid_callback is None:
         pid_callback = lambda pid: None
     
-    # Check gmx command first
-    gmx_cmd = check_gmx_command()
-    if gmx_cmd is None:
-        error_msg = "❌ GROMACS (gmx) command not found! Please install GROMACS first.\n"
-        log_callback(error_msg)
-        raise Exception(error_msg)
-    
-    log_callback(f"✅ Using GROMACS command: {gmx_cmd}\n")
-    
-    # Validate environment
     try:
+        # Validate environment
         validate_environment(gromacs_dir, stage)
-    except Exception as e:
-        log_callback(f"❌ {str(e)}\n")
-        raise
-    
-    # Find MDP file
-    mdp_file = find_mdp_file(gromacs_dir, stage)
-    mdp_basename = os.path.basename(mdp_file)
-    
-    # Determine input structure file
-    try:
-        gro_file = select_input_structure(gromacs_dir, stage)
-    except FileNotFoundError as e:
-        log_callback(f"❌ {str(e)}\n")
-        raise
-    
-    # Output file base name
-    deffnm_map = {
-        "setup": "setup",
-        "equilibration": "equil",
-        "production": "md"
-    }
-    deffnm = deffnm_map.get(stage, "md")
-    
-    # Create log directory
-    logs_dir = os.path.join(gromacs_dir, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(logs_dir, f"{deffnm}_{timestamp}.log")
-    
-    # Validate total_steps
-    if total_steps <= 0:
-        error_msg = f"❌ Invalid total_steps: {total_steps}. Must be > 0.\n"
-        log_callback(error_msg)
-        raise ValueError(error_msg)
-    
-    try:
-        # Write header to log
-        with open(log_file, "w") as f:
-            f.write("=" * 70 + "\n")
-            f.write(f"GROMACS {stage.upper()} RUN\n")
-            f.write("=" * 70 + "\n")
-            f.write(f"Timestamp: {datetime.now().isoformat()}\n")
-            f.write(f"Directory: {gromacs_dir}\n")
-            f.write(f"Stage: {stage}\n")
-            f.write(f"MDP: {mdp_basename}\n")
-            f.write(f"Input: {gro_file}\n")
-            f.write(f"Output: {deffnm}\n")
-            f.write(f"GPU: {use_gpu}\n")
-            f.write(f"Threads: {threads}\n")
-            f.write(f"Total Steps: {total_steps}\n")
-            f.write(f"Resume: {resume}\n")
-            f.write("=" * 70 + "\n\n")
         
+        # Check GROMACS installation
+        gmx_cmd = check_gmx_command()
+        if not gmx_cmd:
+            raise Exception("GROMACS (gmx) not found in PATH. Please install GROMACS.")
+        
+        # Find MDP file
+        mdp_file = find_mdp_file(gromacs_dir, stage)
+        
+        # Get nsteps from MDP for progress tracking
+        from mdp_utils import read_mdp_parameter
+        nsteps_str = read_mdp_parameter(mdp_file, 'nsteps')
+        total_steps = int(nsteps_str) if nsteps_str else 50000
+        
+        # Determine input/output files based on stage
+        if stage == "setup":
+            input_structure = "step3_input.gro"
+            output_prefix = "setup"
+        elif stage == "equilibration":
+            # Try to use output from previous stage
+            if os.path.exists(os.path.join(gromacs_dir, "setup.gro")):
+                input_structure = "setup.gro"
+            else:
+                input_structure = "step3_input.gro"
+            output_prefix = "equil"
+        else:  # production
+            # Try to use output from equilibration, then setup, then original
+            if os.path.exists(os.path.join(gromacs_dir, "equil.gro")):
+                input_structure = "equil.gro"
+            elif os.path.exists(os.path.join(gromacs_dir, "setup.gro")):
+                input_structure = "setup.gro"
+            else:
+                input_structure = "step3_input.gro"
+            output_prefix = "md"
+        
+        # Log setup
+        log_file = os.path.join(gromacs_dir, f"{output_prefix}.log")
+        log_callback(f"\n{'=' * 70}\n")
+        log_callback(f"GROMACS MD RUNNER - {stage.upper()} STAGE\n")
+        log_callback(f"{'=' * 70}\n")
         log_callback(f"📁 Working directory: {gromacs_dir}\n")
-        log_callback(f"📝 Log file: {log_file}\n")
-        log_callback(f"🎯 Stage: {stage.capitalize()}\n")
-        log_callback(f"📄 Input structure: {gro_file}\n")
-        log_callback(f"⚙️  MDP file: {mdp_basename}\n")
+        log_callback(f"📝 MDP file: {os.path.basename(mdp_file)}\n")
+        log_callback(f"🔢 Total steps: {total_steps:,}\n")
+        log_callback(f"🧵 CPU threads: {threads}\n")
+        log_callback(f"📊 Input structure: {input_structure}\n")
+        log_callback(f"📁 Output prefix: {output_prefix}\n")
+        log_callback(f"{'=' * 70}\n\n")
         
-        # Grompp step (preprocessing)
-        tpr_file = os.path.join(gromacs_dir, f"{deffnm}.tpr")
-        need_grompp = not resume or not os.path.exists(tpr_file)
+        # Step 1: grompp (preprocessing)
+        log_callback(f"🔧 Running grompp (preprocessing)...\n")
         
-        if need_grompp:
-            grompp_cmd = [
-                gmx_cmd, "grompp",
-                "-f", mdp_basename,
-                "-c", gro_file,
-                "-r", gro_file,          # ✅ FIX: reference file for restraints
-                "-p", "topol.top",
-                "-o", f"{deffnm}.tpr",
-                "-maxwarn", "2"
-            ]
-
-            
-            # Add index file if it exists
-            index_file = os.path.join(gromacs_dir, "index.ndx")
-            if os.path.exists(index_file):
-                grompp_cmd.extend(["-n", "index.ndx"])
-            
-            log_callback(f"🔧 Running grompp (preprocessing)...\n")
-            with open(log_file, "a") as f:
-                f.write(f"\n{'=' * 70}\n")
-                f.write(f"GROMPP COMMAND\n")
-                f.write(f"{'=' * 70}\n")
-                f.write(f"{' '.join(grompp_cmd)}\n\n")
-            
-            try:
-                grompp_result = subprocess.run(
-                    grompp_cmd, 
-                    cwd=gromacs_dir, 
-                    capture_output=True, 
-                    text=True,
-                    timeout=600  # 10 minute timeout (increased from 5)
-                )
-            except subprocess.TimeoutExpired:
-                error_msg = "❌ grompp timed out after 10 minutes\n"
-                log_callback(error_msg)
-                raise Exception(error_msg)
-            
-            with open(log_file, "a") as f:
-                f.write("=== grompp STDOUT ===\n")
-                f.write(grompp_result.stdout if grompp_result.stdout else "(empty)\n")
-                f.write("\n=== grompp STDERR ===\n")
-                f.write(grompp_result.stderr if grompp_result.stderr else "(empty)\n")
-                f.write("=" * 70 + "\n\n")
-            
-            if grompp_result.returncode != 0:
-                error_msg = f"❌ grompp failed with exit code {grompp_result.returncode}\n"
-                if grompp_result.stderr:
-                    # Show more of the error (1000 chars instead of 500)
-                    error_msg += f"Error output:\n{grompp_result.stderr[:1000]}\n"
-                log_callback(error_msg)
-                raise Exception(f"grompp failed: {grompp_result.stderr}")
-            
-            log_callback(f"✅ grompp completed successfully\n")
-        else:
-            log_callback(f"↩️ Resuming from existing .tpr file\n")
-        
-        # Mdrun step (MD execution)
-        mdrun_cmd = [
-            gmx_cmd, "mdrun",
-            "-deffnm", deffnm,
-            "-nt", str(threads),
-            "-nsteps", str(total_steps)  # Always specify nsteps explicitly
+        grompp_cmd = [
+            gmx_cmd, "grompp",
+            "-f", os.path.basename(mdp_file),
+            "-c", input_structure,
+            "-p", "topol.top",
+            "-o", f"{output_prefix}.tpr",
+            "-maxwarn", "10"
         ]
         
-        # Add checkpoint for resume
-        cpt_file = os.path.join(gromacs_dir, f"{deffnm}.cpt")
-        if resume and os.path.exists(cpt_file):
-            mdrun_cmd.extend(["-cpi", f"{deffnm}.cpt"])
-            log_callback(f"↩️ Resuming from checkpoint: {deffnm}.cpt\n")
+        log_callback(f"Command: {' '.join(grompp_cmd)}\n")
         
-        # GPU settings
+        with open(log_file, "w") as f:
+            f.write(f"{'=' * 70}\n")
+            f.write(f"GROMPP PREPROCESSING\n")
+            f.write(f"{'=' * 70}\n")
+            f.write(f"Started at: {datetime.now().isoformat()}\n")
+            f.write(f"Command: {' '.join(grompp_cmd)}\n")
+            f.write(f"{'=' * 70}\n\n")
+        
+        grompp_result = subprocess.run(
+            grompp_cmd,
+            cwd=gromacs_dir,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minutes max for preprocessing
+        )
+        
+        # Log grompp output
+        with open(log_file, "a") as f:
+            f.write(grompp_result.stdout)
+            if grompp_result.stderr:
+                f.write("\n--- STDERR ---\n")
+                f.write(grompp_result.stderr)
+        
+        if grompp_result.returncode != 0:
+            error_msg = f"❌ grompp failed with exit code {grompp_result.returncode}\n"
+            error_msg += f"Check {log_file} for details\n"
+            log_callback(error_msg)
+            raise Exception(error_msg)
+        
+        log_callback(f"✅ Preprocessing completed\n\n")
+        
+        # Emit special marker after grompp completes
+        log_callback("__SETUP_COMPLETED__")
+        
+        # Step 2: mdrun (actual simulation)
+        mdrun_cmd = [
+            gmx_cmd, "mdrun",
+            "-deffnm", output_prefix,
+            "-nt", str(threads)
+        ]
+        
         if use_gpu:
-            mdrun_cmd.extend([
-                "-nb", "gpu",      # Non-bonded on GPU
-                "-pme", "gpu",     # PME on GPU
-                "-update", "gpu",  # Update on GPU (if supported)
-                "-bonded", "cpu"   # Keep bonded on CPU for compatibility
-            ])
+            mdrun_cmd.extend(["-nb", "gpu", "-pme", "gpu", "-bonded", "gpu"])
             log_callback(f"🎮 GPU acceleration enabled\n")
         
         log_callback(f"🚀 Starting {stage.capitalize()} MD simulation...\n")
@@ -743,69 +644,454 @@ def stop_md(pid, timeout=10):
     except Exception as e:
         print(f"Error stopping process {pid}: {e}")
         return False
-    
 
-import multiprocessing  # Add this import at the top
 
-def run_mmpbsa(work_dir, tpr_file, trajectory, index_file, input_file="mmpbsa.in", log_callback=None, progress_callback=None):
+def get_trajectory_frames(trajectory_path, timeout=30):
     """
-    Executes the gmx_MMPBSA command with MPI parallelization.
+    Get number of frames in a GROMACS trajectory file
+    
+    Args:
+        trajectory_path: Path to .xtc or .trr file
+        timeout: Timeout in seconds for gmx check command
+    
+    Returns:
+        Number of frames, or None if unable to determine
     """
-    # Auto-detect cores (use all but 1 to avoid system lag)
-    n_cores = max(1, multiprocessing.cpu_count() - 1)
-    
-    if log_callback:
-        log_callback(f"Using {n_cores} CPU cores for parallel MMPBSA calculation")
-    
-    cmd = [
-        "mpirun", "-np", str(n_cores),
-        "gmx_MMPBSA", "-O",
-        "-i", input_file,
-        "-cs", tpr_file,
-        "-ct", trajectory,
-        "-ci", index_file,
-        "-cg", "1", "13",  # Default groups – change if needed
-        "-nogui"
-    ]
-    
-    # Reuse your subprocess logic from run_md (with live streaming for logs/progress)
-    process = subprocess.Popen(
-        cmd,
-        cwd=work_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
-    )
-    
-    total_frames = 1000  # Placeholder – parse from mmpbsa.in or trajectory for real progress
-    frame_count = 0
-    
-    while True:
-        line = process.stdout.readline()
-        if not line and process.poll() is not None:
-            break
+    try:
+        result = subprocess.run(
+            ["gmx", "check", "-f", trajectory_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
         
-        if line:
-            if log_callback:
-                log_callback(line.strip())
+        if result.returncode == 0:
+            output = result.stdout + result.stderr
             
-            # Rough progress (customize based on output lines like "Processing frame X")
-            if "frame" in line.lower() or "snapshot" in line.lower():
-                frame_count += 1
-                pct = (frame_count / total_frames) * 100
-                if progress_callback:
-                    progress_callback(pct)
+            # Look for "Last frame X" pattern
+            match = re.search(r"Last frame\s+(\d+)", output)
+            if match:
+                # Frames are 0-indexed, so add 1
+                return int(match.group(1)) + 1
+            
+            # Alternative pattern: "# frames: X"
+            match = re.search(r"#\s*frames:?\s*(\d+)", output, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        
+        return None
+        
+    except subprocess.TimeoutExpired:
+        print(f"Warning: gmx check timed out for {trajectory_path}")
+        return None
+    except FileNotFoundError:
+        print("Warning: gmx command not found")
+        return None
+    except Exception as e:
+        print(f"Warning: Could not determine frame count: {e}")
+        return None
+
+
+def parse_mmpbsa_input(input_file):
+    """
+    Parse mmpbsa.in file to extract settings
     
-    returncode = process.wait()
+    Args:
+        input_file: Path to mmpbsa.in file
     
-    if returncode != 0:
-        error_msg = f"MMPBSA failed with code {returncode}"
+    Returns:
+        Dictionary with parsed settings
+    """
+    settings = {
+        'startframe': 1,
+        'endframe': None,
+        'interval': 1
+    }
+    
+    try:
+        with open(input_file, 'r') as f:
+            content = f.read()
+        
+        # Extract startframe
+        match = re.search(r'startframe\s*=\s*(\d+)', content, re.IGNORECASE)
+        if match:
+            settings['startframe'] = int(match.group(1))
+        
+        # Extract endframe
+        match = re.search(r'endframe\s*=\s*(\d+)', content, re.IGNORECASE)
+        if match:
+            settings['endframe'] = int(match.group(1))
+        
+        # Extract interval
+        match = re.search(r'interval\s*=\s*(\d+)', content, re.IGNORECASE)
+        if match:
+            settings['interval'] = int(match.group(1))
+        
+    except Exception as e:
+        print(f"Warning: Could not parse mmpbsa.in: {e}")
+    
+    return settings
+
+
+def detect_index_groups(work_dir, tpr_file, log_callback=None):
+    """
+    Auto-detect receptor and ligand groups from index.ndx (CHARMM-GUI style)
+    Returns: (receptor_group: int, ligand_group: int)
+    """
+    def log(msg):
         if log_callback:
-            log_callback(error_msg)
-        raise Exception(error_msg)
+            log_callback(msg)
+
+    index_path = os.path.join(work_dir, "index.ndx")
+
+    # Case 1: index.ndx doesn't exist
+    if not os.path.exists(index_path):
+        log("⚠️  index.ndx file not found in working directory.")
+        log("→ Using **default fallback values**: Receptor = 1, Ligand = 13")
+        return 1, 13
+
+    receptor_group = None
+    ligand_group   = None
+
+    try:
+        current_group_num = 0
+        with open(index_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('[') and line.endswith(']'):
+                    current_group_num += 1
+                    name_raw = line[1:-1].strip()
+                    name = name_raw.lower()
+
+                    # Receptor: prefer full protein, avoid partial like -H
+                    if 'protein' in name and '-h' not in name and receptor_group is None:
+                        receptor_group = current_group_num
+                        log(f"✓ Auto-detected **receptor** group: {current_group_num} → '{name_raw}'")
+
+                    # Ligand: match common names, exclude ions/water
+                    ligand_keywords = ['unk', 'lig', 'mol', 'ligand', 'het', 'resname', 'drug', 'comp', 'inh', 'sub']
+                    ion_keywords = ['pot', 'cla', 'na', 'cl', 'ion', 'tip', 'wat', 'sol']
+                    if any(kw in name for kw in ligand_keywords) and not any(ik in name for ik in ion_keywords):
+                        if ligand_group is None:
+                            ligand_group = current_group_num
+                            log(f"✓ Auto-detected **ligand** group: {current_group_num} → '{name_raw}'")
+
+        # Fallbacks if nothing found
+        messages = []
+        if receptor_group is None:
+            receptor_group = 1
+            messages.append("   → Receptor set to default: 1 (Protein)")
+        if ligand_group is None:
+            ligand_group = 13
+            messages.append("   → Ligand set to default: 13 (common for UNK in CHARMM-GUI)")
+
+        if messages:
+            log("⚠️  Partial or no auto-detection — using fallback values")
+            for msg in messages:
+                log(msg)
+        else:
+            log("✅ Successfully auto-detected both groups from index.ndx")
+
+        log(f"→ Using groups → Receptor: {receptor_group} | Ligand: {ligand_group}")
+
+        return receptor_group, ligand_group
+
+    except Exception as e:
+        log(f"❌ Error during group auto-detection: {str(e)}")
+        log("→ Falling back to safe defaults: Receptor = 1, Ligand = 13")
+        return 1, 13
+
+
+
+
+def run_mmpbsa(
+    work_dir, 
+    tpr_file, 
+    trajectory, 
+    index_file, 
+    input_file="mmpbsa.in",
+    topology_file="topol.top",
+    receptor_group=None,
+    ligand_group=None,
+    n_cores=None,
+    log_callback=None, 
+    progress_callback=None
+):
+    """
+    Run gmx_MMPBSA calculation with proper error handling and progress tracking
     
-    if log_callback:
-        log_callback("MMPBSA completed successfully")
-    if progress_callback:
-        progress_callback(100)
+    Args:
+        work_dir: Working directory containing all files
+        tpr_file: TPR file name (e.g., "md.tpr")
+        trajectory: Trajectory file name (e.g., "md.xtc")
+        index_file: Index file name (e.g., "index.ndx")
+        input_file: MMPBSA input file (default: "mmpbsa.in")
+        topology_file: Topology file (default: "topol.top")
+        receptor_group: Receptor group index (auto-detect if None)
+        ligand_group: Ligand group index (auto-detect if None)
+        n_cores: Number of CPU cores to use (auto-detect if None)
+        log_callback: Function to receive log messages
+        progress_callback: Function to receive progress updates (percentage)
+    
+    Returns:
+        Exit code (0 for success)
+    
+    Raises:
+        Exception: On validation or execution errors
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(msg, end='')
+    
+    def update_progress(pct):
+        if progress_callback:
+            progress_callback(min(100, int(pct)))
+    
+    try:
+        log(f"\n{'=' * 70}\n")
+        log(f"GMXMMPBSA BINDING FREE ENERGY CALCULATION\n")
+        log(f"{'=' * 70}\n")
+        
+        # Validate required files
+        required_files = {
+            'TPR': tpr_file,
+            'Trajectory': trajectory,
+            'Topology': topology_file,
+            'Input': input_file
+        }
+        
+        missing = []
+        for name, fname in required_files.items():
+            fpath = os.path.join(work_dir, fname)
+            if not os.path.exists(fpath):
+                missing.append(f"{name} ({fname})")
+        
+        if missing:
+            raise Exception(f"Missing required files: {', '.join(missing)}")
+        
+        log(f"✅ All required files found\n")
+        
+        # Get trajectory frame count
+        traj_path = os.path.join(work_dir, trajectory)
+        n_frames = get_trajectory_frames(traj_path)
+        
+        if n_frames is not None:
+            log(f"📊 Trajectory has {n_frames} frames\n")
+        else:
+            log(f"⚠️ Could not determine frame count from trajectory\n")
+            n_frames = 1000  # Fallback estimate
+        
+        # Parse MMPBSA input settings
+        input_path = os.path.join(work_dir, input_file)
+        settings = parse_mmpbsa_input(input_path)
+        
+        # Calculate effective frames for analysis
+        start = settings['startframe']
+        end = settings['endframe'] if settings['endframe'] else n_frames
+        interval = settings['interval']
+        
+        effective_frames = max(1, (end - start + 1) // interval)
+        log(f"📊 Will analyze ~{effective_frames} frames (start={start}, end={end}, interval={interval})\n")
+        
+        # Auto-detect optimal core count
+        if n_cores is None:
+            max_cores = multiprocessing.cpu_count()
+            # Use at most: (1) all but 1 core, (2) number of frames
+            n_cores = min(max_cores - 1, effective_frames)
+            n_cores = max(1, n_cores)  # At least 1
+        
+        # Ensure cores <= frames (gmx_MMPBSA requirement)
+        if n_cores > effective_frames:
+            log(f"⚠️ Reducing cores from {n_cores} to {effective_frames} (must have ≤ frames)\n")
+            n_cores = effective_frames
+        
+        log(f"🧵 Using {n_cores} CPU core(s) for parallel calculation\n")
+        
+        # Auto-detect receptor and ligand groups if not provided
+        if receptor_group is None or ligand_group is None:
+            auto_receptor, auto_ligand = detect_index_groups(work_dir, tpr_file, log)
+            if receptor_group is None:
+                receptor_group = auto_receptor
+            if ligand_group is None:
+                ligand_group = auto_ligand
+        
+        log(f"🎯 Receptor group: {receptor_group}, Ligand group: {ligand_group}\n")
+        
+        # Check if gmx_MMPBSA is available
+        try:
+            result = subprocess.run(
+                ["which", "gmx_MMPBSA"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                raise Exception("gmx_MMPBSA not found in PATH. Please ensure it's installed and activated.")
+        except subprocess.TimeoutExpired:
+            raise Exception("Timeout checking for gmx_MMPBSA")
+        
+        log(f"{'=' * 70}\n\n")
+        
+        # Build command
+        # Note: Use --use-hwthread-cpus if MPI slots are limited
+        cmd = [
+            "mpirun",
+            "--use-hwthread-cpus",  # Allow oversubscription if needed
+            "-np", str(n_cores),
+            "gmx_MMPBSA",
+            "-O",  # Overwrite existing files
+            "-i", input_file,
+            "-cs", tpr_file,
+            "-ct", trajectory,
+            "-ci", index_file,
+            "-cg", str(receptor_group), str(ligand_group),
+            "-cp", topology_file  # CRITICAL: topology file is required!
+        ]
+        
+        log(f"🚀 Starting MMPBSA calculation...\n")
+        log(f"Command: {' '.join(cmd)}\n")
+        log(f"{'=' * 70}\n\n")
+        
+        # Create log file
+        mmpbsa_log = os.path.join(work_dir, "gmx_MMPBSA.log")
+        
+        # Start process
+        process = subprocess.Popen(
+            cmd,
+            cwd=work_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        
+        log(f"📊 Process PID: {process.pid}\n\n")
+        
+        # Monitor output with timeout handling
+        start_time = time.time()
+        timeout_seconds = 3600 * 24  # 24 hours max
+        
+        frame_count = 0
+        last_progress = 0
+        
+        # Error patterns to detect
+        error_patterns = [
+            r"Fatal error",
+            r"Error:",
+            r"MMPBSA_Error",
+            r"Traceback",
+            r"failed",
+            r"Cannot find",
+            r"No such file"
+        ]
+        
+        while True:
+            # Check timeout
+            if time.time() - start_time > timeout_seconds:
+                process.kill()
+                raise Exception(f"MMPBSA calculation timed out after {timeout_seconds}s")
+            
+            line = process.stdout.readline()
+            
+            # Check if process finished
+            if not line and process.poll() is not None:
+                break
+            
+            if line:
+                line_stripped = line.strip()
+                log(line)
+                
+                # Track progress based on various output patterns
+                
+                # Pattern 1: Frame processing (e.g., "Processing frame 10/100")
+                if "frame" in line_stripped.lower():
+                    match = re.search(r'(\d+)\s*/\s*(\d+)', line_stripped)
+                    if match:
+                        current = int(match.group(1))
+                        total = int(match.group(2))
+                        pct = (current / total) * 100
+                        if pct > last_progress:
+                            update_progress(pct)
+                            last_progress = pct
+                
+                # Pattern 2: Progress bars (e.g., "50%|##########|")
+                if "%" in line_stripped and "|" in line_stripped:
+                    match = re.search(r'(\d+)%', line_stripped)
+                    if match:
+                        pct = int(match.group(1))
+                        if pct > last_progress:
+                            update_progress(pct)
+                            last_progress = pct
+                
+                # Pattern 3: Stage completions
+                stage_markers = [
+                    "Building AMBER topologies",
+                    "Preparing trajectories",
+                    "Running calculations",
+                    "Parsing results",
+                    "completed successfully"
+                ]
+                
+                for i, marker in enumerate(stage_markers):
+                    if marker.lower() in line_stripped.lower():
+                        # Each stage represents 20% progress
+                        pct = ((i + 1) / len(stage_markers)) * 100
+                        if pct > last_progress:
+                            update_progress(pct)
+                            last_progress = pct
+                
+                # Check for errors
+                for pattern in error_patterns:
+                    if re.search(pattern, line_stripped, re.IGNORECASE):
+                        log(f"\n⚠️ Potential error detected: {line_stripped}\n")
+        
+        # Wait for process to finish
+        returncode = process.wait()
+        
+        # Calculate runtime
+        runtime = time.time() - start_time
+        hours = int(runtime // 3600)
+        minutes = int((runtime % 3600) // 60)
+        seconds = int(runtime % 60)
+        
+        log(f"\n{'=' * 70}\n")
+        
+        if returncode == 0:
+            log(f"✅ MMPBSA calculation completed successfully!\n")
+            update_progress(100)
+            
+            # Check for output files
+            result_files = [
+                "FINAL_RESULTS_MMPBSA.dat",
+                "FINAL_RESULTS_MMPBSA.csv"
+            ]
+            
+            found_results = []
+            for rf in result_files:
+                if os.path.exists(os.path.join(work_dir, rf)):
+                    found_results.append(rf)
+            
+            if found_results:
+                log(f"📄 Results saved to: {', '.join(found_results)}\n")
+            
+        else:
+            log(f"❌ MMPBSA calculation failed with exit code {returncode}\n")
+            log(f"💡 Check {mmpbsa_log} for details\n")
+            raise Exception(f"MMPBSA failed with exit code {returncode}")
+        
+        log(f"⏱️  Runtime: {hours:02d}:{minutes:02d}:{seconds:02d}\n")
+        log(f"{'=' * 70}\n")
+        
+        return returncode
+        
+    except subprocess.TimeoutExpired:
+        raise Exception("MMPBSA process timed out")
+    except KeyboardInterrupt:
+        if 'process' in locals():
+            process.kill()
+        raise Exception("MMPBSA calculation interrupted by user")
+    except Exception as e:
+        log(f"\n❌ Error: {str(e)}\n")
+        raise
