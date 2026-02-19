@@ -12,7 +12,8 @@ venv/
 .venv/
 ENV/
 env/
-
+mmpbsa/
+.mmpbsa/
 # =========================
 # Packaging / Distribution
 # =========================

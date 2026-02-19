@@ -178,15 +178,8 @@ def update_mdp_nsteps(mdp_path, ns, backup=True):
                 # Check if this is an nsteps line (case-insensitive)
                 # Match: "nsteps = 123" or "nsteps=123"
                 if re.match(r'^\s*nsteps\s*=', line, re.IGNORECASE):
-                    # Preserve indentation
-                    indent = line[:len(line) - len(line.lstrip())]
-                    
-                    # Check for inline comment
-                    comment_match = re.search(r';.*$', line)
-                    comment = comment_match.group(0) if comment_match else ""
-                    
-                    # Write updated line with preserved formatting
-                    new_lines.append(f"{indent}nsteps = {nsteps}{' ' + comment if comment else ''}\n")
+                    # Replace with new nsteps value
+                    new_lines.append(f"nsteps                  = {nsteps}       ; {ns} ns (auto-calculated)\n")
                     updated = True
                 else:
                     new_lines.append(line)
@@ -200,10 +193,70 @@ def update_mdp_nsteps(mdp_path, ns, backup=True):
         with open(mdp_path, "w") as f:
             f.writelines(new_lines)
         
-        return nsteps
+        # Also update output frequencies for optimal frame count
+        _update_output_frequencies(mdp_path, ns, timestep_fs / 1000, backup=False)
         
+        return nsteps
+            
     except Exception as e:
         raise ValueError(f"Error updating MDP file: {str(e)}")
+
+
+def _update_output_frequencies(mdp_path, total_ns, dt_ps, backup=True):
+    """
+    Internal function to update output frequencies based on simulation length
+    
+    Args:
+        mdp_path: Path to MDP file  
+        total_ns: Total simulation time in nanoseconds
+        dt_ps: Timestep in picoseconds
+        backup: Whether to create backup (default: True)
+    """
+    # Intelligently determine save intervals based on simulation length
+    if total_ns < 1.0:
+        # Very short runs: save frequently - aim for ~100 frames
+        save_interval_ps = max(0.1, total_ns * 1000 / 100)
+    elif total_ns < 10.0:
+        # Short-medium runs: aim for ~500 frames
+        save_interval_ps = max(1.0, total_ns * 1000 / 500)
+    else:
+        # Long runs: aim for ~1000 frames
+        save_interval_ps = max(10.0, total_ns * 1000 / 1000)
+    
+    # Round to nearest sensible value
+    if save_interval_ps < 1:
+        save_interval_ps = round(save_interval_ps, 1)
+    else:
+        save_interval_ps = round(save_interval_ps)
+    
+    # Convert to steps
+    nstxout_compressed = max(1, int(save_interval_ps / dt_ps))
+    nstenergy = nstxout_compressed
+    nstlog = nstxout_compressed
+    
+    # Read and update the file
+    new_lines = []
+    
+    try:
+        with open(mdp_path, 'r') as f:
+            for line in f:
+                # Update output frequencies
+                if re.match(r'^\s*nstxout-compressed\s*=', line, re.IGNORECASE):
+                    new_lines.append(f"nstxout-compressed      = {nstxout_compressed}       ; Save coordinates every {save_interval_ps} ps\n")
+                elif re.match(r'^\s*nstenergy\s*=', line, re.IGNORECASE):
+                    new_lines.append(f"nstenergy               = {nstenergy}       ; Save energy every {save_interval_ps} ps\n")
+                elif re.match(r'^\s*nstlog\s*=', line, re.IGNORECASE):
+                    new_lines.append(f"nstlog                  = {nstlog}       ; Update log every {save_interval_ps} ps\n")
+                else:
+                    new_lines.append(line)
+        
+        # Write updated contents back
+        with open(mdp_path, 'w') as f:
+            f.writelines(new_lines)
+    
+    except Exception as e:
+        print(f"Warning: Could not update output frequencies: {e}")
+
 
 def update_mdp_parameter(mdp_path, parameter_name, parameter_value, backup=True):
     """

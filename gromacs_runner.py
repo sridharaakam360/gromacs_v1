@@ -10,6 +10,7 @@ import re
 import sys
 import time
 import multiprocessing
+import select
 from datetime import datetime
 
 
@@ -38,6 +39,10 @@ def check_gmx_command():
             )
             if result.returncode == 0:
                 return variant
+        
+        # Try standard installation path before giving up
+        if os.path.exists("/usr/local/gromacs/bin/gmx"):
+            return "/usr/local/gromacs/bin/gmx"
         
         return None
         
@@ -70,10 +75,24 @@ def validate_environment(gromacs_dir, stage):
     
     elif stage == "equilibration":
         # Need either setup output or original input
-        setup_gro = os.path.join(gromacs_dir, "setup.gro")
+        # Need either setup output (minimized structure) or original input
+        # Check for various minimization output names
+        setup_candidates = [
+            "setup.gro",
+            "step4_0_minimization.gro",
+            "step4.0_minimization.gro",
+            "minim.gro"
+        ]
+        
+        has_setup = False
+        for cand in setup_candidates:
+            if os.path.exists(os.path.join(gromacs_dir, cand)):
+                has_setup = True
+                break
+        
         original_gro = os.path.join(gromacs_dir, "step3_input.gro")
         
-        if not os.path.exists(setup_gro) and not os.path.exists(original_gro):
+        if not has_setup and not os.path.exists(original_gro):
             raise Exception(
                 "Missing input structure for equilibration. "
                 "Run 'setup' stage first or provide step3_input.gro"
@@ -366,11 +385,22 @@ def run_md(
             input_structure = "step3_input.gro"
             output_prefix = "setup"
         elif stage == "equilibration":
-            # Try to use output from previous stage
-            if os.path.exists(os.path.join(gromacs_dir, "setup.gro")):
-                input_structure = "setup.gro"
-            else:
-                input_structure = "step3_input.gro"
+        # Try to use output from previous stage (setup/minimization)
+            input_structure = "step3_input.gro"  # Default fallback
+            
+            # Check for various minimization output names (priority order)
+            setup_candidates = [
+                "setup.gro",
+                "step4_0_minimization.gro",
+                "step4.0_minimization.gro",
+                "minim.gro"
+            ]
+            
+            for cand in setup_candidates:
+                if os.path.exists(os.path.join(gromacs_dir, cand)):
+                    input_structure = cand
+                    break
+            
             output_prefix = "equil"
         else:  # production
             # Try to use output from equilibration, then setup, then original
@@ -402,10 +432,17 @@ def run_md(
             gmx_cmd, "grompp",
             "-f", os.path.basename(mdp_file),
             "-c", input_structure,
-            "-p", "topol.top",
+            "-r", input_structure,
+            "-p", "topol.top"
+        ]
+
+        if os.path.exists(os.path.join(gromacs_dir, "index.ndx")):
+            grompp_cmd.extend(["-n", "index.ndx"])
+            
+        grompp_cmd.extend([
             "-o", f"{output_prefix}.tpr",
             "-maxwarn", "10"
-        ]
+        ])
         
         log_callback(f"Command: {' '.join(grompp_cmd)}\n")
         
@@ -733,9 +770,92 @@ def parse_mmpbsa_input(input_file):
     return settings
 
 
+def create_custom_index(work_dir, tpr_file, log_callback=None):
+    """
+    Automates the creation of custom index groups using gmx make_ndx.
+    Tries multiple common residue names if primary names don't exist.
+    
+    Args:
+        work_dir: Working directory path
+        tpr_file: Path to .tpr file
+        log_callback: Optional callback for logging messages
+    
+    Returns:
+        Tuple of (success: bool, index_file_path: str, receptor_name: str, ligand_name: str)
+        The names returned are the residue names used for the groups (e.g., 'PROA', 'UNK')
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+    
+    try:
+        log("🔧 Creating custom index groups...")
+        
+        # Define backup residue names to try if primaries fail
+        # These are typical in GROMACS/CHARMM systems
+        receptor_candidates = ["PROA", "PROT", "PRO", "Protein", "PTERA"]
+        ligand_candidates = ["UNK", "LIG", "MOL", "HET", "COMP", "RES", "DRG", "INH"]
+        
+        # Try each combination until one succeeds
+        attempted = []
+        for receptor_res in receptor_candidates:
+            for ligand_res in ligand_candidates:
+                try:
+                    # Construct the gmx make_ndx command with proper escaping
+                    echo_cmd = f'echo -e "r {receptor_res}\\nr {ligand_res}\\nq"'
+                    index_file = os.path.join(work_dir, "index_mmpbsa.ndx")
+                    index_basename = os.path.basename(index_file)
+                    tpr_basename = os.path.basename(tpr_file)
+                    
+                    # Build and run the command
+                    cmd = f'{echo_cmd} | gmx make_ndx -f {tpr_basename} -o {index_basename} 2>&1'
+                    
+                    result = subprocess.run(
+                        cmd,
+                        shell=True,
+                        cwd=work_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    
+                    # Check if index file was created successfully
+                    if result.returncode == 0 and os.path.exists(index_file):
+                        # Quick validation: check if file has content
+                        if os.path.getsize(index_file) > 0:
+                            log(f"✅ Successfully created index file using residues:")
+                            log(f"   Receptor: {receptor_res} | Ligand: {ligand_res}")
+                            return True, index_file, receptor_res, ligand_res
+                    
+                    attempted.append(f"{receptor_res}+{ligand_res}")
+                
+                except subprocess.TimeoutExpired:
+                    attempted.append(f"{receptor_res}+{ligand_res} (timeout)")
+                    continue
+                except Exception:
+                    attempted.append(f"{receptor_res}+{ligand_res} (error)")
+                    continue
+        
+        # If we get here, no combination worked
+        log("⚠️  Could not create index file with standard residue names")
+        log(f"   Tried: {', '.join(attempted[:5])}...")  # Show first 5 attempts
+        log("\n💡 TROUBLESHOOTING:")
+        log("   1. Check what residues exist in your system:")
+        log(f"      gmx editconf -f {tpr_basename} -pr && cat confout.gro | head -100")
+        log("   2. Or check the topology file for residue names")
+        log("   3. Then use those residue names with gmx make_ndx manually:")
+        log('      echo -e "r YOUR_RECEPTOR\\nr YOUR_LIGAND\\nq" | gmx make_ndx -f md.tpr -o index.ndx')
+        return False, None, None, None
+            
+    except Exception as e:
+        log(f"❌ Error creating custom index: {str(e)}")
+        return False, None, None, None
+
+
 def detect_index_groups(work_dir, tpr_file, log_callback=None):
     """
     Auto-detect receptor and ligand groups from index.ndx (CHARMM-GUI style)
+    If index.ndx doesn't exist or has invalid groups, automatically creates it using gmx make_ndx.
     Returns: (receptor_group: int, ligand_group: int)
     """
     def log(msg):
@@ -744,55 +864,155 @@ def detect_index_groups(work_dir, tpr_file, log_callback=None):
 
     index_path = os.path.join(work_dir, "index.ndx")
 
-    # Case 1: index.ndx doesn't exist
+    # Helper function to parse index file and get available groups
+    def parse_available_groups(ndx_file):
+        """Parse index file and return list of (group_number, group_name) tuples"""
+        groups = []
+        try:
+            current_group_num = -1
+            with open(ndx_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('[') and line.endswith(']'):
+                        current_group_num += 1
+                        name = line[1:-1].strip()
+                        groups.append((current_group_num, name))
+        except Exception as e:
+            log(f"Warning: Could not parse {ndx_file}: {e}")
+        return groups
+
+    # Case 1: index.ndx doesn't exist - Attempt to create it automatically
     if not os.path.exists(index_path):
         log("⚠️  index.ndx file not found in working directory.")
-        log("→ Using **default fallback values**: Receptor = 1, Ligand = 13")
-        return 1, 13
+        log("🔄 Attempting to create custom index groups automatically...")
+        
+        success, custom_index, receptor_name, ligand_name = create_custom_index(work_dir, tpr_file, log_callback)
+        
+        if success and os.path.exists(custom_index):
+            # Use the newly created index file
+            index_path = custom_index
+            log(f"✅ Auto-created index file: {custom_index}")
+        else:
+            log("⚠️  Could not auto-create index.ndx.")
+            log("→ Using **default fallback values**: Receptor = 1, Ligand = 13")
+            return 1, 13
 
     receptor_group = None
     ligand_group   = None
 
     try:
-        current_group_num = 0
-        with open(index_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith('[') and line.endswith(']'):
-                    current_group_num += 1
-                    name_raw = line[1:-1].strip()
-                    name = name_raw.lower()
+        # Parse the index file and get all available groups
+        available_groups = parse_available_groups(index_path)
+        
+        if not available_groups:
+            log("❌ Index file is empty or has no groups.")
+            log("→ Falling back to safe defaults: Receptor = 1, Ligand = 13")
+            return 1, 13
+        
+        log(f"📋 Available groups in index file: {len(available_groups)} groups found")
+        for gnum, gname in available_groups:
+            log(f"   Group {gnum}: {gname}")
+        
+        # Now perform auto-detection
+        # GROMACS index groups are zero-based:
+        # [System]=0, [Protein]=1, ...
+        for group_num, name_raw in available_groups:
+            name = name_raw.lower()
 
-                    # Receptor: prefer full protein, avoid partial like -H
-                    if 'protein' in name and '-h' not in name and receptor_group is None:
-                        receptor_group = current_group_num
-                        log(f"✓ Auto-detected **receptor** group: {current_group_num} → '{name_raw}'")
+            # Receptor: prefer full protein, avoid partial like -H
+            if 'protein' in name and '-h' not in name and receptor_group is None:
+                receptor_group = group_num
+                log(f"✓ Auto-detected **receptor** group: {group_num} → '{name_raw}'")
 
-                    # Ligand: match common names, exclude ions/water
-                    ligand_keywords = ['unk', 'lig', 'mol', 'ligand', 'het', 'resname', 'drug', 'comp', 'inh', 'sub']
-                    ion_keywords = ['pot', 'cla', 'na', 'cl', 'ion', 'tip', 'wat', 'sol']
-                    if any(kw in name for kw in ligand_keywords) and not any(ik in name for ik in ion_keywords):
-                        if ligand_group is None:
-                            ligand_group = current_group_num
-                            log(f"✓ Auto-detected **ligand** group: {current_group_num} → '{name_raw}'")
+            # Ligand: match common names, exclude ions/water
+            ligand_keywords = ['unk', 'lig', 'mol', 'ligand', 'het', 'resname', 'drug', 'comp', 'inh', 'sub']
+            ion_keywords = ['pot', 'cla', 'na', 'cl', 'ion', 'tip', 'wat', 'sol']
+            if any(kw in name for kw in ligand_keywords) and not any(ik in name for ik in ion_keywords):
+                if ligand_group is None:
+                    ligand_group = group_num
+                    log(f"✓ Auto-detected **ligand** group: {group_num} → '{name_raw}'")
 
-        # Fallbacks if nothing found
-        messages = []
+        # If auto-detection failed, try intelligent fallback
+        if receptor_group is None or ligand_group is None:
+            log("⚠️  Standard keywords not found. Analyzing available groups...")
+            
+            # Look for SOLU (solute) group - common pattern in many setups
+            solu_group = None
+            for gnum, gname in available_groups:
+                if gname.lower() == 'solu':
+                    solu_group = gnum
+                    log(f"   Found SOLU group at index {gnum} - this is likely protein + ligand")
+                    break
+            
+            # Identify groups to avoid (solvent/ions)
+            bad_groups = []
+            for gnum, gname in available_groups:
+                gname_lower = gname.lower()
+                if any(kw in gname_lower for kw in ['solv', 'water', 'wat', 'ion', 'sol', 'tip']):
+                    bad_groups.append(gnum)
+                    log(f"   Excluding group {gnum} ({gname}) - contains solvent/ions")
+            
+            # Smart fallback strategy
+            if solu_group is not None and receptor_group is None:
+                receptor_group = solu_group
+                log(f"   Using SOLU group ({solu_group}) for receptor - will create separate ligand via gmx_MMPBSA")
+            
+            # If still no groups, find the best non-solvent groups
+            if receptor_group is None:
+                for gnum, gname in available_groups:
+                    if gnum not in bad_groups:
+                        receptor_group = gnum
+                        log(f"   Using group {gnum} ({gname}) for receptor")
+                        break
+            
+            if ligand_group is None:
+                # Try to find a second good group, or use the same as receptor
+                for gnum, gname in available_groups:
+                    if gnum not in bad_groups and gnum != receptor_group:
+                        ligand_group = gnum
+                        log(f"   Using group {gnum} ({gname}) for ligand")
+                        break
+                
+                # If only one good group exists, use it for both (gmx_MMPBSA will handle separation)
+                if ligand_group is None:
+                    ligand_group = receptor_group
+                    log(f"   Using same group ({receptor_group}) for both - relying on gmx_MMPBSA auto-detection")
+
+        # Final safety fallback
         if receptor_group is None:
             receptor_group = 1
-            messages.append("   → Receptor set to default: 1 (Protein)")
         if ligand_group is None:
-            ligand_group = 13
-            messages.append("   → Ligand set to default: 13 (common for UNK in CHARMM-GUI)")
+            ligand_group = 2
 
-        if messages:
-            log("⚠️  Partial or no auto-detection — using fallback values")
-            for msg in messages:
-                log(msg)
-        else:
-            log("✅ Successfully auto-detected both groups from index.ndx")
-
+        available_group_nums = [g[0] for g in available_groups]
+        
         log(f"→ Using groups → Receptor: {receptor_group} | Ligand: {ligand_group}")
+        
+        # Validate and warn if using solvent groups
+        solvent_keywords = ['solv', 'water', 'wat', 'ion', 'sol', 'tip']
+        for gnum, gname in available_groups:
+            if gnum in [receptor_group, ligand_group]:
+                if any(kw in gname.lower() for kw in solvent_keywords):
+                    log(f"⚠️  WARNING: Group {gnum} ({gname}) contains solvent - gmx_MMPBSA may fail!")
+                    log("🔄 Attempting to create a new custom index file...")
+                    
+                    success, custom_index, _, _ = create_custom_index(work_dir, tpr_file, log_callback)
+                    if success and os.path.exists(custom_index):
+                        # Replace the old index.ndx with the new one
+                        try:
+                            import shutil
+                            shutil.copy(custom_index, index_path)
+                            log(f"✅ Replaced index.ndx with auto-created version")
+                        except Exception as e:
+                            log(f"Note: Could not replace index.ndx: {e}")
+                        
+                        # Re-parse and use new groups
+                        available_groups = parse_available_groups(index_path)
+                        if available_groups:
+                            receptor_group = available_groups[0][0]
+                            ligand_group = available_groups[1][0] if len(available_groups) > 1 else available_groups[0][0]
+                            log(f"✅ Using newly created groups: Receptor={receptor_group}, Ligand={ligand_group}")
+                    break
 
         return receptor_group, ligand_group
 
@@ -811,287 +1031,122 @@ def run_mmpbsa(
     index_file, 
     input_file="mmpbsa.in",
     topology_file="topol.top",
-    receptor_group=None,
-    ligand_group=None,
-    n_cores=None,
+    receptor_group=1,
+    ligand_group=13,
+    n_cores=1,
     log_callback=None, 
-    progress_callback=None
+    progress_callback=None,
+    pid_callback=None
 ):
     """
-    Run gmx_MMPBSA calculation with proper error handling and progress tracking
-    
-    Args:
-        work_dir: Working directory containing all files
-        tpr_file: TPR file name (e.g., "md.tpr")
-        trajectory: Trajectory file name (e.g., "md.xtc")
-        index_file: Index file name (e.g., "index.ndx")
-        input_file: MMPBSA input file (default: "mmpbsa.in")
-        topology_file: Topology file (default: "topol.top")
-        receptor_group: Receptor group index (auto-detect if None)
-        ligand_group: Ligand group index (auto-detect if None)
-        n_cores: Number of CPU cores to use (auto-detect if None)
-        log_callback: Function to receive log messages
-        progress_callback: Function to receive progress updates (percentage)
-    
-    Returns:
-        Exit code (0 for success)
-    
-    Raises:
-        Exception: On validation or execution errors
+    Optimized MMPBSA runner using specific system paths and environment prep.
     """
     def log(msg):
-        if log_callback:
-            log_callback(msg)
-        else:
-            print(msg, end='')
+        if log_callback: log_callback(msg)
+
+    # 1. Define absolute paths based on user environment
+    mmpbsa_bin_path = "/home/sridhar/gromacs_v1/mmpbsa/bin/gmx_MMPBSA"
+    amber_bin_path = "/home/sridhar/miniconda/envs/amber_env/bin"
     
-    def update_progress(pct):
-        if progress_callback:
-            progress_callback(min(100, int(pct)))
-    
+    # 2. Update Environment Variables so gmx_MMPBSA finds sander/cpptraj
+    env = os.environ.copy()
+    env["PATH"] = f"{amber_bin_path}:/home/sridhar/gromacs_v1/mmpbsa/bin:{env.get('PATH', '')}"
+
     try:
-        log(f"\n{'=' * 70}\n")
-        log(f"GMXMMPBSA BINDING FREE ENERGY CALCULATION\n")
-        log(f"{'=' * 70}\n")
+        log(f"🚀 Initializing gmx_MMPBSA from: {mmpbsa_bin_path}\n")
         
-        # Validate required files
-        required_files = {
-            'TPR': tpr_file,
-            'Trajectory': trajectory,
-            'Topology': topology_file,
-            'Input': input_file
-        }
-        
-        missing = []
-        for name, fname in required_files.items():
-            fpath = os.path.join(work_dir, fname)
-            if not os.path.exists(fpath):
-                missing.append(f"{name} ({fname})")
-        
-        if missing:
-            raise Exception(f"Missing required files: {', '.join(missing)}")
-        
-        log(f"✅ All required files found\n")
-        
-        # Get trajectory frame count
-        traj_path = os.path.join(work_dir, trajectory)
-        n_frames = get_trajectory_frames(traj_path)
-        
-        if n_frames is not None:
-            log(f"📊 Trajectory has {n_frames} frames\n")
-        else:
-            log(f"⚠️ Could not determine frame count from trajectory\n")
-            n_frames = 1000  # Fallback estimate
-        
-        # Parse MMPBSA input settings
-        input_path = os.path.join(work_dir, input_file)
-        settings = parse_mmpbsa_input(input_path)
-        
-        # Calculate effective frames for analysis
-        start = settings['startframe']
-        end = settings['endframe'] if settings['endframe'] else n_frames
-        interval = settings['interval']
-        
-        effective_frames = max(1, (end - start + 1) // interval)
-        log(f"📊 Will analyze ~{effective_frames} frames (start={start}, end={end}, interval={interval})\n")
-        
-        # Auto-detect optimal core count
-        if n_cores is None:
-            max_cores = multiprocessing.cpu_count()
-            # Use at most: (1) all but 1 core, (2) number of frames
-            n_cores = min(max_cores - 1, effective_frames)
-            n_cores = max(1, n_cores)  # At least 1
-        
-        # Ensure cores <= frames (gmx_MMPBSA requirement)
-        if n_cores > effective_frames:
-            log(f"⚠️ Reducing cores from {n_cores} to {effective_frames} (must have ≤ frames)\n")
-            n_cores = effective_frames
-        
-        log(f"🧵 Using {n_cores} CPU core(s) for parallel calculation\n")
-        
-        # Auto-detect receptor and ligand groups if not provided
-        if receptor_group is None or ligand_group is None:
-            auto_receptor, auto_ligand = detect_index_groups(work_dir, tpr_file, log)
-            if receptor_group is None:
-                receptor_group = auto_receptor
-            if ligand_group is None:
-                ligand_group = auto_ligand
-        
-        log(f"🎯 Receptor group: {receptor_group}, Ligand group: {ligand_group}\n")
-        
-        # Check if gmx_MMPBSA is available
-        try:
-            result = subprocess.run(
-                ["which", "gmx_MMPBSA"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode != 0:
-                raise Exception("gmx_MMPBSA not found in PATH. Please ensure it's installed and activated.")
-        except subprocess.TimeoutExpired:
-            raise Exception("Timeout checking for gmx_MMPBSA")
-        
-        log(f"{'=' * 70}\n\n")
-        
-        # Build command
-        # Note: Use --use-hwthread-cpus if MPI slots are limited
+        # 3. Build the MPI command
+        # Note: Added -O to overwrite and specific path to executable
         cmd = [
-            "mpirun",
-            "--use-hwthread-cpus",  # Allow oversubscription if needed
+            "mpirun", "--use-hwthread-cpus", 
             "-np", str(n_cores),
-            "gmx_MMPBSA",
-            "-O",  # Overwrite existing files
+            mmpbsa_bin_path,
+            "-O",
             "-i", input_file,
             "-cs", tpr_file,
             "-ct", trajectory,
             "-ci", index_file,
             "-cg", str(receptor_group), str(ligand_group),
-            "-cp", topology_file  # CRITICAL: topology file is required!
+            "-cp", topology_file
         ]
-        
-        log(f"🚀 Starting MMPBSA calculation...\n")
-        log(f"Command: {' '.join(cmd)}\n")
-        log(f"{'=' * 70}\n\n")
-        
-        # Create log file
-        mmpbsa_log = os.path.join(work_dir, "gmx_MMPBSA.log")
-        
-        # Start process
+
+        log(f"📋 Command: {' '.join(cmd)}\n")
+
         process = subprocess.Popen(
             cmd,
             cwd=work_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1
+            bufsize=1,
+            env=env  # Use the updated environment
         )
-        
-        log(f"📊 Process PID: {process.pid}\n\n")
-        
-        # Monitor output with timeout handling
-        start_time = time.time()
-        timeout_seconds = 3600 * 24  # 24 hours max
-        
-        frame_count = 0
-        last_progress = 0
-        
-        # Error patterns to detect
-        error_patterns = [
-            r"Fatal error",
-            r"Error:",
-            r"MMPBSA_Error",
-            r"Traceback",
-            r"failed",
-            r"Cannot find",
-            r"No such file"
-        ]
-        
-        while True:
-            # Check timeout
-            if time.time() - start_time > timeout_seconds:
-                process.kill()
-                raise Exception(f"MMPBSA calculation timed out after {timeout_seconds}s")
-            
-            line = process.stdout.readline()
-            
-            # Check if process finished
-            if not line and process.poll() is not None:
-                break
-            
-            if line:
-                line_stripped = line.strip()
-                log(line)
-                
-                # Track progress based on various output patterns
-                
-                # Pattern 1: Frame processing (e.g., "Processing frame 10/100")
-                if "frame" in line_stripped.lower():
-                    match = re.search(r'(\d+)\s*/\s*(\d+)', line_stripped)
-                    if match:
-                        current = int(match.group(1))
-                        total = int(match.group(2))
-                        pct = (current / total) * 100
-                        if pct > last_progress:
-                            update_progress(pct)
-                            last_progress = pct
-                
-                # Pattern 2: Progress bars (e.g., "50%|##########|")
-                if "%" in line_stripped and "|" in line_stripped:
-                    match = re.search(r'(\d+)%', line_stripped)
-                    if match:
-                        pct = int(match.group(1))
-                        if pct > last_progress:
-                            update_progress(pct)
-                            last_progress = pct
-                
-                # Pattern 3: Stage completions
-                stage_markers = [
-                    "Building AMBER topologies",
-                    "Preparing trajectories",
-                    "Running calculations",
-                    "Parsing results",
-                    "completed successfully"
-                ]
-                
-                for i, marker in enumerate(stage_markers):
-                    if marker.lower() in line_stripped.lower():
-                        # Each stage represents 20% progress
-                        pct = ((i + 1) / len(stage_markers)) * 100
-                        if pct > last_progress:
-                            update_progress(pct)
-                            last_progress = pct
-                
-                # Check for errors
-                for pattern in error_patterns:
-                    if re.search(pattern, line_stripped, re.IGNORECASE):
-                        log(f"\n⚠️ Potential error detected: {line_stripped}\n")
-        
-        # Wait for process to finish
-        returncode = process.wait()
-        
-        # Calculate runtime
-        runtime = time.time() - start_time
-        hours = int(runtime // 3600)
-        minutes = int((runtime % 3600) // 60)
-        seconds = int(runtime % 60)
-        
-        log(f"\n{'=' * 70}\n")
-        
-        if returncode == 0:
-            log(f"✅ MMPBSA calculation completed successfully!\n")
-            update_progress(100)
-            
-            # Check for output files
-            result_files = [
-                "FINAL_RESULTS_MMPBSA.dat",
-                "FINAL_RESULTS_MMPBSA.csv"
-            ]
-            
-            found_results = []
-            for rf in result_files:
-                if os.path.exists(os.path.join(work_dir, rf)):
-                    found_results.append(rf)
-            
-            if found_results:
-                log(f"📄 Results saved to: {', '.join(found_results)}\n")
-            
+
+        # Inform caller of the started process PID so UI/monitoring can track it
+        if pid_callback:
+            try:
+                pid_callback(process.pid)
+            except Exception:
+                pass
+
+        # Read output without blocking indefinitely; use select so we can
+        # detect process termination even if stdout is quiet.
+        try:
+            while True:
+                reads, _, _ = select.select([process.stdout], [], [], 0.5)
+                if reads:
+                    line = process.stdout.readline()
+                    if not line:
+                        # EOF reached for stdout; if process ended, break.
+                        if process.poll() is not None:
+                            break
+                        continue
+
+                    log(line)
+                    # Simple progress tracking based on frame completion
+                    if "calculating" in line.lower() and "/" in line:
+                        try:
+                            match = re.search(r'(\d+)/(\d+)', line)
+                            if match and progress_callback:
+                                pct = (int(match.group(1)) / int(match.group(2))) * 100
+                                progress_callback(pct)
+                        except:
+                            pass
+                else:
+                    # No new data this iteration; check if process exited.
+                    if process.poll() is not None:
+                        # Drain any remaining output
+                        try:
+                            remaining = process.stdout.read()
+                            if remaining:
+                                for l in remaining.splitlines(True):
+                                    log(l)
+                                    if "calculating" in l.lower() and "/" in l and progress_callback:
+                                        try:
+                                            match = re.search(r'(\d+)/(\d+)', l)
+                                            if match:
+                                                pct = (int(match.group(1)) / int(match.group(2))) * 100
+                                                progress_callback(pct)
+                                        except: pass
+                        except Exception:
+                            pass
+                        break
+
+        finally:
+            returncode = process.wait()
+
+        if returncode != 0:
+            raise Exception(f"gmx_MMPBSA failed with exit code {returncode}")
+
+        # Confirm expected final result file presence if available
+        final_result_path = os.path.join(work_dir, 'FINAL_RESULTS_MMPBSA.dat')
+        if os.path.exists(final_result_path):
+            log(f"\n✅ MMPBSA calculation finished successfully! Results: {final_result_path}\n")
         else:
-            log(f"❌ MMPBSA calculation failed with exit code {returncode}\n")
-            log(f"💡 Check {mmpbsa_log} for details\n")
-            raise Exception(f"MMPBSA failed with exit code {returncode}")
-        
-        log(f"⏱️  Runtime: {hours:02d}:{minutes:02d}:{seconds:02d}\n")
-        log(f"{'=' * 70}\n")
-        
-        return returncode
-        
-    except subprocess.TimeoutExpired:
-        raise Exception("MMPBSA process timed out")
-    except KeyboardInterrupt:
-        if 'process' in locals():
-            process.kill()
-        raise Exception("MMPBSA calculation interrupted by user")
+            log("\n✅ MMPBSA calculation finished successfully!\n")
+
+        return 0
+
     except Exception as e:
-        log(f"\n❌ Error: {str(e)}\n")
-        raise
+        log(f"\n❌ MMPBSA Error: {str(e)}")
+        raise e

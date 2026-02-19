@@ -11,6 +11,17 @@ import re  # for regex parsing in system info
 from system_info import cpu_info, gpu_info, check_mmpbsa_installed
 from mdp_utils import update_mdp_nsteps, get_mdp_file, generate_default_mmpbsa_in
 from gromacs_runner import detect_index_groups, run_md, stop_md, run_mmpbsa
+import importlib
+import gromacs_runner
+# Force reload to pick up changes in gromacs_runner during development/debugging
+importlib.reload(gromacs_runner)
+
+# Re-bind functions to the reloaded module versions
+run_md = gromacs_runner.run_md
+stop_md = gromacs_runner.stop_md
+detect_index_groups = gromacs_runner.detect_index_groups
+run_mmpbsa = gromacs_runner.run_mmpbsa
+check_gmx_command = gromacs_runner.check_gmx_command
 
 # --------------------------------------------------
 # Module-level lock for thread safety
@@ -51,8 +62,8 @@ defaults = {
     "analysis_finished": False,
     "analysis_progress": 0,
     "analysis_logs": [],
-    "analysis_log_queue": queue.Queue(),  # ← ADD THIS
     "show_mmpbsa_logs": False,
+    "analysis_result_path": None,
 }
 
 for k, v in defaults.items():
@@ -62,6 +73,8 @@ for k, v in defaults.items():
 # Initialize Queue separately for each session
 if "log_queue" not in st.session_state:
     st.session_state.log_queue = queue.Queue()
+if "analysis_log_queue" not in st.session_state:
+    st.session_state.analysis_log_queue = queue.Queue()
 
 # --------------------------------------------------
 # Helper Functions
@@ -78,6 +91,8 @@ def safe_read_file(filepath, max_size=MAX_FILE_SIZE):
         
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             return f.read()
+    except ValueError:
+        raise
     except Exception as e:
         raise Exception(f"Error reading file: {str(e)}")
 
@@ -210,7 +225,8 @@ if tab == "MD Simulation":
             "step4.1_equilibration.mdp",
             "step4_equilibration.mdp",
             "step5_production.mdp",
-            "topol.top"
+            "topol.top",
+            "index.ndx"
         ]
         
         found_files = {}
@@ -298,10 +314,12 @@ if tab == "MD Simulation":
 
     ns = st.number_input(
         "Simulation time (ns)", 
-        min_value=0.1, 
+        min_value=0.001, 
         max_value=float(MAX_SIMULATION_TIME_NS),
         value=10.0,
-        help=f"Simulation time in nanoseconds (max {MAX_SIMULATION_TIME_NS} ns)"
+        step=0.001,
+        format="%.3f",
+        help=f"Simulation time in nanoseconds (min 0.001 ns, max {MAX_SIMULATION_TIME_NS} ns)"
     )
 
     # Stage selection with gating
@@ -309,8 +327,17 @@ if tab == "MD Simulation":
 
     # Auto-detect setup completion from files
     if charmm_dir and os.path.isdir(charmm_dir):
-        setup_output = os.path.join(charmm_dir, "setup.gro")
-        if os.path.exists(setup_output) and not st.session_state.setup_completed:
+        # Check for various minimization output names
+        setup_candidates = [
+            "setup.gro",
+            "step4_0_minimization.gro",
+            "step4.0_minimization.gro",
+            "minim.gro"
+        ]
+        
+        is_setup_done = any(os.path.exists(os.path.join(charmm_dir, f)) for f in setup_candidates)
+        
+        if is_setup_done and not st.session_state.setup_completed:
             st.session_state.setup_completed = True
             st.success("✅ Setup output detected - all stages unlocked!")
 
@@ -377,26 +404,24 @@ if tab == "MD Simulation":
     def pid_callback(pid):
         """Store process PID (thread-safe)"""
         with _state_lock:
-            st.session_state.md_pid = pid
+                st.session_state.md_pid = pid
 
     # --------------------------------------------------
     # Background runner
     # --------------------------------------------------
-    def run_job(gromacs_dir_param, use_gpu_param, threads_param, total_steps_param, stage_param, resume=False):
+    def run_job(gromacs_dir_param, stage_param, use_gpu_param, threads_param):
         """
         Run MD simulation in background thread
         """
         try:
             result = run_md(
                 gromacs_dir=gromacs_dir_param,
+                stage=stage_param,
                 use_gpu=use_gpu_param,
                 threads=threads_param,
-                total_steps=total_steps_param,
-                resume=resume,
                 log_callback=log_callback,
                 progress_callback=progress_callback,
-                pid_callback=pid_callback,
-                stage=stage_param
+                pid_callback=pid_callback
             )
 
             with _state_lock:
@@ -467,11 +492,9 @@ if tab == "MD Simulation":
                             target=run_job,
                             kwargs={
                                 "gromacs_dir_param": charmm_dir,
-                                "use_gpu_param": use_gpu,
-                                "threads_param": threads,
-                                "total_steps_param": nsteps,
                                 "stage_param": st.session_state.current_stage,
-                                "resume": False
+                                "use_gpu_param": use_gpu,
+                                "threads_param": threads
                             },
                             daemon=False
                         )
@@ -486,13 +509,15 @@ if tab == "MD Simulation":
     with col2:
         if st.button("⏸ Pause", disabled=not st.session_state.running, help="Pause the simulation"):
             success = stop_md(st.session_state.md_pid)
-            with _state_lock:
-                st.session_state.running = False
-                st.session_state.paused = True
-            
             if success:
+                with _state_lock:
+                    st.session_state.running = False
+                    st.session_state.paused = True
                 st.warning("⏸ MD paused (checkpoint saved)")
             else:
+                with _state_lock:
+                    st.session_state.running = True
+                    st.session_state.paused = False
                 st.error("❌ Failed to pause simulation")
 
     with col3:
@@ -506,11 +531,9 @@ if tab == "MD Simulation":
                 target=run_job,
                 kwargs={
                     "gromacs_dir_param": charmm_dir,
-                    "use_gpu_param": run_mode.startswith("GPU"),
-                    "threads_param": threads,
-                    "total_steps_param": st.session_state.total_steps,
                     "stage_param": st.session_state.current_stage,
-                    "resume": True
+                    "use_gpu_param": run_mode.startswith("GPU"),
+                    "threads_param": threads
                 },
                 daemon=False
             )
@@ -675,9 +698,14 @@ elif tab == "MMPBSA Analysis":
 
         if os.path.exists(xtc_path) and os.path.exists(tpr_path):
             try:
+                # Get GROMACS command path (fallback to standard install path)
+                gmx_cmd = check_gmx_command()
+                if not gmx_cmd:
+                    gmx_cmd = "/usr/local/gromacs/bin/gmx"
+                
                 # Number of frames
                 result = subprocess.run(
-                    ["gmx", "check", "-f", xtc_path],
+                    [gmx_cmd, "check", "-f", xtc_path],
                     capture_output=True, text=True, timeout=15, check=False
                 )
                 if result.returncode == 0:
@@ -690,7 +718,7 @@ elif tab == "MMPBSA Analysis":
 
                 # Number of atoms
                 result2 = subprocess.run(
-                    ["gmx", "dump", "-s", tpr_path],
+                    [gmx_cmd, "dump", "-s", tpr_path],
                     capture_output=True, text=True, timeout=20, check=False
                 )
                 if result2.returncode == 0:
@@ -712,7 +740,130 @@ elif tab == "MMPBSA Analysis":
             info_container.info("Trajectory or topology file not found → system info unavailable")
 
         st.divider()
-
+        
+        # Add comprehensive command reference guide
+        with st.expander("📚 **Complete MMPBSA Workflow - Command Reference**", expanded=False):
+            st.markdown("""
+            ### Complete Workflow Commands
+            
+            This reference guide shows every command needed for MMPBSA binding energy analysis.
+            
+            ---
+            
+            #### 1️⃣ Simulation & Trajectory Verification
+            
+            **Run MD simulation:**
+            ```bash
+            gmx mdrun -deffnm md -nt 6
+            ```
+            
+            **Check trajectory frames:**
+            ```bash
+            gmx check -f md.xtc
+            ```
+            
+            ---
+            
+            #### 2️⃣ Environment Setup
+            
+            Connect AmberTools and gmx_MMPBSA to your system:
+            
+            **Add AmberTools to PATH:**
+            ```bash
+            export PATH="/home/sridhar/miniconda/envs/amber_env/bin:$PATH"
+            ```
+            
+            **Add gmx_MMPBSA to PATH (optional):**
+            ```bash
+            export PATH="/home/sridhar/gromacs_v1/mmpbsa/bin:$PATH"
+            ```
+            
+            ---
+            
+            #### 3️⃣ Prepare Input Files
+            
+            **Create `mmpbsa.in` input file:**
+            ```bash
+            cat <<EOF > mmpbsa.in
+&general
+  sys_name="MGL0999_MMPBSA",
+  startframe=1,
+  endframe=101,
+  interval=1,
+/
+&gb
+  igb=2, saltcon=0.150,
+/
+EOF
+            ```
+            
+            **Prepare index file and check group numbers:**
+            ```bash
+            # Generate index automatically
+            echo -e "q\\n" | gmx make_ndx -f md.gro -o index.ndx
+            
+            # Check group numbers interactively
+            gmx make_ndx -f md.gro -n index.ndx
+            ```
+            
+            ---
+            
+            #### 4️⃣ Run MMPBSA Calculation
+            
+            **Execute binding energy calculation:**
+            ```bash
+            /home/sridhar/gromacs_v1/mmpbsa/bin/gmx_MMPBSA -O \\
+              -i mmpbsa.in \\
+              -cs md.tpr \\
+              -ci index.ndx \\
+              -cg 1 13 \\
+              -ct md.xtc \\
+              -cp topol.top \\
+              -o binding_energy.dat
+            ```
+            
+            > 💡 **Note**: Replace `1 13` with your actual Protein and Ligand group numbers
+            
+            ---
+            
+            #### 5️⃣ Analyze Results
+            
+            **Open graphical analyzer:**
+            ```bash
+            /home/sridhar/gromacs_v1/mmpbsa/bin/gmx_MMPBSA_ana -f binding_energy.dat
+            ```
+            
+            **View text summary:**
+            ```bash
+            cat binding_energy.dat
+            ```
+            
+            ---
+            
+            #### 6️⃣ (Optional) Fix PBC Issues
+            
+            Before running on long trajectories, center the protein-ligand complex:
+            
+            ```bash
+            gmx trjconv -s md.tpr -f md.xtc -o md_fixed.xtc -pbc mol -center
+            ```
+            
+            > ⚠️ **When prompted**: Select protein group for centering, then System for output
+            
+            ---
+            
+            ### 📌 Quick Tips
+            
+            - **Always verify frame count** before running MMPBSA (min 50-100 frames)
+            - **Check group numbers** in index.ndx - they vary by system
+            - **Use GB first** (igb=2 or 5) for faster testing, then PB for accuracy
+            - **Start small**: Test with fewer frames first (`interval=5` or `10`)
+            
+            """)
+        
+        st.divider()
+        
+        # ────────────────────────────────────────────────
         # In MMPBSA tab
         st.subheader("Index Groups (critical!)")
         col1, col2 = st.columns(2)
@@ -759,8 +910,8 @@ elif tab == "MMPBSA Analysis":
         # Optional: small expander with override
         with st.expander("Change groups manually (if needed)", expanded=False):
             col1, col2 = st.columns(2)
-            override_rec = col1.number_input("Receptor group", value=int(rec_group), min_value=1, step=1)
-            override_lig = col2.number_input("Ligand group",   value=int(lig_group),   min_value=1, step=1)
+            override_rec = col1.number_input("Receptor group", value=int(rec_group), min_value=0, step=1, key="override_receptor")
+            override_lig = col2.number_input("Ligand group",   value=int(lig_group),   min_value=0, step=1, key="override_ligand")
 
             if override_rec != rec_group or override_lig != lig_group:
                 st.warning("→ Using **overridden** values when running MMPBSA")
@@ -836,8 +987,35 @@ fillratio = 4.0,
         # Status
         if st.session_state.analysis_running:
             st.info("🟢 MMPBSA is running... (initial preparation can take 10–60 min before logs appear)")
-        elif st.session_state.analysis_finished:
+        elif st.session_state.analysis_finished and st.session_state.get("analysis_result_path"):
             st.success("✅ MMPBSA completed! Check folder for FINAL_RESULTS.dat / .csv")
+
+            final_path = st.session_state.get("analysis_result_path")
+            if final_path and os.path.exists(final_path):
+                cols = st.columns([1, 1, 2])
+                with cols[0]:
+                    if st.button("📂 Open final results"):
+                        try:
+                            content = safe_read_file(final_path)
+                            with st.expander(f"📄 {os.path.basename(final_path)}", expanded=True):
+                                st.text_area("Final Results", value=content, height=400, disabled=True)
+                        except Exception as e:
+                            st.error(f"Failed to open results: {e}")
+
+                with cols[1]:
+                    try:
+                        content_for_download = safe_read_file(final_path)
+                        st.download_button("⬇️ Download results", data=content_for_download, file_name=os.path.basename(final_path))
+                    except Exception:
+                        st.button("⬇️ Download results", disabled=True)
+
+                with cols[2]:
+                    st.caption(f"Detected: {os.path.basename(final_path)}")
+            else:
+                st.info("Result file was marked detected but cannot be found on disk. Refresh or check folder.")
+        elif st.session_state.analysis_finished:
+            # Analysis finished but no result detected yet — don't show green success
+            st.info("⚠️ MMPBSA run finished but no result file was detected in the analysis folder.")
         elif st.session_state.error:
             st.error(f"Error during MMPBSA: {st.session_state.error}")
 
@@ -874,14 +1052,31 @@ fillratio = 4.0,
                 st.session_state.analysis_progress = 0
                 st.session_state.analysis_logs = []
                 st.session_state.error = None
+                st.session_state.analysis_result_path = None
+
+            # Capture queue locally so background threads don't touch st.session_state
+            analysis_queue = st.session_state.analysis_log_queue
 
             def log_cb(msg):
-                if "analysis_log_queue" in st.session_state:
-                    st.session_state.analysis_log_queue.put(msg)
+                try:
+                    analysis_queue.put(msg)
+                except Exception:
+                    pass
 
             def progress_cb(pct):
-                with _state_lock:
-                    st.session_state.analysis_progress = min(100, int(pct))
+                try:
+                    analysis_queue.put(f"__MMPBSA_PROGRESS__:{int(pct)}")
+                except Exception:
+                    pass
+
+            def pid_cb(pid):
+                try:
+                    analysis_queue.put(f"__MMPBSA_PID__:{int(pid)}")
+                except Exception:
+                    pass
+
+            # Use an Event to signal watcher thread to stop; avoid touching st.session_state
+            analysis_stop_event = threading.Event()
 
             def run_thread():
                 try:
@@ -892,23 +1087,43 @@ fillratio = 4.0,
                         index_file="index.ndx",
                         input_file="mmpbsa.in",
                         topology_file="topol.top",
-                        receptor_group=rec_group,   # ← CHANGE TO THIS (from None)
-                        ligand_group=lig_group,     # ← CHANGE TO THIS (from None)
-                        n_cores=None,
+                        receptor_group=rec_group,
+                        ligand_group=lig_group,
+                        n_cores=n_cores,
                         log_callback=log_cb,
-                        progress_callback=progress_cb
+                        progress_callback=progress_cb,
+                        pid_callback=pid_cb
                     )
-                    with _state_lock:
-                        st.session_state.analysis_running = False
-                        st.session_state.analysis_finished = True
-                        st.session_state.analysis_progress = 100
+                    # Notify main thread that analysis finished
+                    analysis_queue.put("__MMPBSA_FINISHED__")
                 except Exception as e:
-                    with _state_lock:
-                        st.session_state.error = str(e)
-                        st.session_state.analysis_running = False
+                    analysis_queue.put(f"__MMPBSA_ERROR__:{str(e)}")
+                finally:
+                    analysis_stop_event.set()
 
             thread = threading.Thread(target=run_thread, daemon=False)
             thread.start()
+            # Start a watcher thread that will detect final result files and notify via queue
+            def result_watcher(wdir, stop_event):
+                final_files = [
+                    os.path.join(wdir, 'FINAL_RESULTS_MMPBSA.dat'),
+                    os.path.join(wdir, 'FINAL_RESULTS.dat'),
+                    os.path.join(wdir, 'gmx_MMPBSA.log')
+                ]
+                while not stop_event.is_set():
+                    for f in final_files:
+                        try:
+                            if os.path.exists(f):
+                                analysis_queue.put(f"✅ Detected result file: {os.path.basename(f)}\n")
+                                analysis_queue.put("__MMPBSA_FINISHED__")
+                                stop_event.set()
+                                return
+                        except Exception:
+                            pass
+                    time.sleep(2)
+
+            watcher = threading.Thread(target=result_watcher, args=(analysis_dir, analysis_stop_event), daemon=True)
+            watcher.start()
             st.rerun()
 
 # --------------------------------------------------
@@ -922,6 +1137,99 @@ while not st.session_state.log_queue.empty():
         _logs_changed = True
         continue
     st.session_state.logs.append(line)
+    _logs_changed = True
+
+while not st.session_state.analysis_log_queue.empty():
+    line = st.session_state.analysis_log_queue.get_nowait()
+    # Handle special control messages from background threads
+    try:
+        if isinstance(line, str) and line.startswith("__MMPBSA_PID__:"):
+            pid = int(line.split(":", 1)[1])
+            with _state_lock:
+                st.session_state.analysis_pid = pid
+            st.session_state.analysis_logs.append(f"🔢 gmx_MMPBSA PID: {pid}\n")
+            _logs_changed = True
+            continue
+
+        if isinstance(line, str) and line.startswith("__MMPBSA_PROGRESS__:"):
+            pct = int(line.split(":", 1)[1])
+            with _state_lock:
+                st.session_state.analysis_progress = min(100, pct)
+            _logs_changed = True
+            continue
+
+        if isinstance(line, str) and line == "__MMPBSA_FINISHED__":
+            with _state_lock:
+                st.session_state.analysis_running = False
+                st.session_state.analysis_finished = True
+                st.session_state.analysis_progress = 100
+            st.session_state.analysis_logs.append("✅ MMPBSA finished\n")
+            _logs_changed = True
+            continue
+
+        if isinstance(line, str) and line.startswith("__MMPBSA_ERROR__:"):
+            msg = line.split(":", 1)[1]
+            with _state_lock:
+                st.session_state.analysis_running = False
+                st.session_state.error = msg
+            st.session_state.analysis_logs.append(f"❌ MMPBSA error: {msg}\n")
+            _logs_changed = True
+            continue
+
+        # If a detector message was emitted in plain text, capture it too
+        if isinstance(line, str) and line.strip().startswith("✅ Detected result file:"):
+            # Extract filename and try to resolve the actual path in the analysis folder
+            try:
+                fname = line.split(":", 1)[1].strip()
+                root = analysis_dir if 'analysis_dir' in locals() and analysis_dir else st.session_state.get('mmpbsa_analysis_dir', '')
+
+                candidate_path = None
+
+                # If fname is absolute, check directly
+                if os.path.isabs(fname) and os.path.exists(fname):
+                    candidate_path = fname
+                else:
+                    # Check exact join
+                    if root:
+                        joined = os.path.join(root, fname)
+                        if os.path.exists(joined):
+                            candidate_path = joined
+
+                    # Fallback: case-insensitive substring match in directory
+                    if candidate_path is None and root and os.path.isdir(root):
+                        for entry in os.listdir(root):
+                            try:
+                                if fname.lower() in entry.lower():
+                                    cand = os.path.join(root, entry)
+                                    if os.path.exists(cand):
+                                        candidate_path = cand
+                                        break
+                            except Exception:
+                                continue
+
+                if candidate_path:
+                    with _state_lock:
+                        st.session_state.analysis_result_path = candidate_path
+                        st.session_state.analysis_running = False
+                        st.session_state.analysis_finished = True
+                        st.session_state.analysis_progress = 100
+                    st.session_state.analysis_logs.append(f"✅ Detected result file on disk: {os.path.basename(candidate_path)}\n")
+                    _logs_changed = True
+                    continue
+                else:
+                    # File not yet present on disk; keep watching but log the notice
+                    st.session_state.analysis_logs.append(f"ℹ️ Detected result filename in logs: {fname} — will watch for file on disk.\n")
+                    _logs_changed = True
+                    continue
+            except Exception:
+                pass
+
+    except Exception:
+        # Fall through to append raw line
+        pass
+
+    st.session_state.analysis_logs.append(line)
+    _logs_changed = True
 
 if st.session_state.running and st.session_state.md_thread and not st.session_state.md_thread.is_alive():
     st.session_state.running = False
@@ -933,8 +1241,16 @@ if _logs_changed:
     st.rerun()
 
 # --------------------------------------------------
-# Auto-refresh when running
+# Auto-refresh when running (light polling)
 # --------------------------------------------------
+# When a background job is active we poll briefly and rerun the script so
+# the main thread can pick up queued messages (PID, progress, file detection)
+# This keeps the UI responsive without background threads touching Streamlit state.
 if st.session_state.running or st.session_state.analysis_running:
-    time.sleep(2)
-    st.rerun()
+    # Short sleep to yield to background threads and avoid tight loop
+    time.sleep(1)
+    try:
+        st.rerun()
+    except Exception:
+        # If rerun isn't allowed in this context, fall back to simple refresh
+        pass
